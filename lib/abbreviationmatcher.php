@@ -8,9 +8,11 @@
 // 3. Case-insensitive match with [-_.–—] replaced by spaces
 // 2. Case-insensitive word match with [-_.–—] replaced by spaces
 // 1. Case-insensitive CamelCase match with [-_.–—] replaced by spaces
+//
 // If a word match is performed, prefer matches that match more complete words.
 // Words must appear in order, so pattern "hello kitty" does not match "kitty
 // hello".
+//
 // If the pattern has no Unicode characters, these steps are performed against
 // the deaccented subject (so subjects “élan” and “elan” match pattern “elan”
 // with the same priority). If the pattern has Unicode characters, then exact
@@ -269,10 +271,13 @@ class AbbreviationMatcher {
     private $nanal = 0;
     /** @var array<string,list<int>> */
     private $matches = [];
-    /** @var array<int,Abbreviator> */
-    private $abbreviators = [];
     /** @var array<int,float> */
     private $prio = [];
+
+    /** @var list<string> */
+    private $xtesters = [];
+    /** @var array<string,list<int>> */
+    private $xmatches = [];
 
     static private $lazy_marker;
 
@@ -286,6 +291,7 @@ class AbbreviationMatcher {
     function add($name, $data, int $tflags = 0) {
         $this->data[] = [$name, null, $data, $tflags];
         $this->matches = [];
+        $this->xmatches = [];
     }
     /** @param string $name
      * @param callable(...):T $callback
@@ -293,19 +299,24 @@ class AbbreviationMatcher {
     function add_lazy($name, $callback, $args, int $tflags = 0) {
         $this->data[] = [$name, null, self::$lazy_marker, $tflags, $callback, $args];
         $this->matches = [];
-    }
-    function set_abbreviator(int $tflags, Abbreviator $abbreviator) {
-        $this->abbreviators[$tflags] = $abbreviator;
+        $this->xmatches = [];
     }
     function set_priority(int $tflags, float $prio) {
         $this->prio[$tflags] = $prio;
     }
 
     static function dedash($text) {
-        return preg_replace('{(?:[-_.\s]|–|—)+}', " ", $text);
+        return preg_replace('/(?:[-_.\s]|–|—)+/', " ", $text);
     }
     static function is_camel_word($text) {
-        return preg_match('{\A[-_.A-Za-z0-9]*(?:[A-Za-z](?=[-_.A-Z0-9])|[0-9](?=[-_.A-Za-z]))[-_.A-Za-z0-9]*\*?\z}', $text);
+        return preg_match('/\A[-_.A-Za-z0-9]*(?:[A-Za-z](?=[-_.A-Z0-9])|[0-9](?=[-_.A-Za-z]))[-_.A-Za-z0-9]*\*?\z/', $text);
+    }
+    static function is_camel_word_x($text) {
+        return preg_match('/\A[_.A-Za-z0-9]*(?:[A-Za-z](?=[_.A-Z0-9])|[0-9](?=[_.A-Za-z]))[_.A-Za-z0-9]*\*?\z/', $text);
+    }
+    static function prepare_namestr($text) {
+        preg_match_all('/[A-Za-z_~?!]+|(?:[0-9]|\.[0-9])[0-9._]*/', $text, $m);
+        return empty($m[0]) ? "" : " " . join(" ", $m[0]);
     }
 
     private function _analyze() {
@@ -317,8 +328,11 @@ class AbbreviationMatcher {
             }
             $this->data[$this->nanal][0] = $name;
             $this->data[$this->nanal][1] = self::dedash($uname);
+            $uname = strtolower($uname);
+            $this->xtesters[] = self::prepare_namestr($uname);
             ++$this->nanal;
         }
+        assert($this->nanal === count($this->xtesters));
     }
 
     /** @param int $i
@@ -386,8 +400,6 @@ class AbbreviationMatcher {
                 }
                 if ($d[2] instanceof Abbreviator) {
                     $abbreviator = $d[2];
-                } else if (isset($this->abbreviators[$d[3]])) {
-                    $abbreviator = $this->abbreviators[$d[3]];
                 } else {
                     continue;
                 }
@@ -409,11 +421,97 @@ class AbbreviationMatcher {
         $this->matches[$pattern] = $matches;
     }
 
+    private function _xfind_all($pattern) {
+        if (empty($this->xmatches)) {
+            $this->_analyze();
+        }
+        // A call to Abbreviator::abbreviation_for() might call back in
+        // to AbbreviationMatcher::find_all(). Short-circuit that call.
+        $this->xmatches[$pattern] = [];
+
+        $upat = $pattern;
+        if (!is_usascii($upat)) {
+            $upat = UnicodeHelper::deaccent(UnicodeHelper::normalize($upat));
+        }
+
+        $re = '';
+        $npatternw = 0;
+        if (self::is_camel_word_x($upat)) {
+            preg_match_all('/[A-Za-z_~][a-z_~?!]+|[A-Z][A-Z]*(?![a-z])|[-+]?(?:[0-9]|\.[0-9])[0-9._]*/', $upat, $m);
+            foreach ($m[0] as $w) {
+                $re .= $re === "" ? " " : ".*? ";
+                if (strlen($w) > 1 && ctype_upper($w)) {
+                    $re .= join("(?:.*? )??", str_split($w));
+                } else if (strpos("-+0123456789.", $w[0]) !== false) {
+                    $re .= $w . "(?![0-9])";
+                } else {
+                    $re .= preg_quote($w, "/");
+                }
+                ++$npatternw;
+            }
+        } else {
+            preg_match_all('/[A-Za-z_~0-9?!*^$@#]+/', $upat, $m);
+            foreach ($m[0] as $w) {
+                $re .= $re === "" ? " " : ".*? ";
+                $re .= preg_quote($w, "/");
+                if (ctype_digit($w[strlen($w) - 1])) {
+                    $re .= "(?![0-9])";
+                }
+                ++$npatternw;
+            }
+        }
+        $star = strpos($pattern, "*");
+        $re = strtolower($re);
+        $re = '/' . ($star === false ? $re : str_replace("\\*", ".*", $re)) . '/s';
+        $xt = preg_grep($re, $this->xtesters);
+        if (count($xt) > 1 && $star !== 0) {
+            $status = 0;
+            $xtx = [];
+            $re = preg_replace('/\.\*\?(?! \))/', '(.*?)', $re);
+            if (!str_ends_with($pattern, "*")) {
+                $re = substr($re, 0, -2) . '(.*)/s';
+            }
+            foreach (array_keys($xt) as $i) {
+                $t = $this->xtesters[$i];
+                preg_match($re, $t, $m, PREG_OFFSET_CAPTURE);
+                $this_status = 0;
+                if ($m[0][1] === 0) {
+                    if ($star !== false) {
+                        $this_status += 100;
+                    } else if (substr_count($t, " ") === $npatternw) {
+                        $this_status += 200;
+                    }
+                }
+                for ($j = 1; isset($m[$j]); ++$j) {
+                    if ($m[$j][0] === "" || $m[$j][0][0] === " ") {
+                        $this_status += 1;
+                    }
+                }
+                if ($this_status > $status) {
+                    $xtx = [$i];
+                    $status = $this_status;
+                } else if ($this_status === $status) {
+                    $xtx[] = $i;
+                }
+            }
+        } else {
+            $xtx = array_keys($xt);
+        }
+        $this->xmatches[$pattern] = $xtx;
+    }
+
     /** @param string $pattern
      * @return list<T> */
     function find_all($pattern, $tflags = 0) {
         if (!array_key_exists($pattern, $this->matches)) {
             $this->_find_all($pattern);
+            $this->_xfind_all($pattern);
+            if ($this->matches[$pattern] != $this->xmatches[$pattern]) {
+                error_log(Conf::$main->dbname . ": matching $pattern: "
+                    . json_encode(array_map(function ($i) { return $this->data[$i][0]; }, $this->matches[$pattern]))
+                    . " vs. "
+                    . json_encode(array_map(function ($i) { return $this->data[$i][0]; }, $this->xmatches[$pattern])));
+            }
         }
         $results = [];
         $last = false;
@@ -476,8 +574,6 @@ class AbbreviationMatcher {
                     }
                     if ($d[2] instanceof Abbreviator) {
                         $abbreviator = $d[2];
-                    } else if (isset($this->abbreviators[$d[3]])) {
-                        $abbreviator = $this->abbreviators[$d[3]];
                     } else {
                         $abbreviator = null;
                     }

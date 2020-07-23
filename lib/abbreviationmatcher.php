@@ -505,8 +505,8 @@ class AbbreviationMatcher {
     function find_all($pattern, $tflags = 0) {
         if (!array_key_exists($pattern, $this->matches)) {
             $this->_find_all($pattern);
-            $this->_xfind_all($pattern);
-            if ($this->matches[$pattern] != $this->xmatches[$pattern]) {
+            //$this->_xfind_all($pattern);
+            if (false && $this->matches[$pattern] != $this->xmatches[$pattern]) {
                 error_log(Conf::$main->dbname . ": matching $pattern: "
                     . json_encode(array_map(function ($i) { return $this->data[$i][0]; }, $this->matches[$pattern]))
                     . " vs. "
